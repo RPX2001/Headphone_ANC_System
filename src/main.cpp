@@ -2,6 +2,10 @@
 #include <driver/i2s.h>
 #include <driver/adc.h>
 #include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <complex>
 
 // ============= Configuration Parameters =============
 #define SAMPLE_RATE 44100          // Sample rate in Hz
@@ -34,6 +38,14 @@ float reference_buffer[LMS_FILTER_LENGTH]; // Reference signal buffer
 float error_signal = 0.0;                  // Current error signal
 float secondary_output = 0.0;              // Anti-noise signal
 uint32_t sample_count = 0;                 // Sample counter for sine generation
+
+// FreeRTOS objects for inter-task communication
+static QueueHandle_t refQueue = NULL;    // Queue of float reference samples
+static QueueHandle_t errorQueue = NULL;  // Queue of float error samples
+
+// Single-tone least-squares configuration (target 1000 Hz)
+const float TARGET_FREQ = 1000.0f; // Hz to cancel
+const float lambda_reg = 1e-3f; // Tikhonov regularization
 
 // ============= Function Prototypes =============
 void setup_i2s_primary();
@@ -184,46 +196,143 @@ void setup() {
   
   Serial.println("=== ANC System Ready ===");
   delay(1000);
+
+  // Create queues: hold a few buffers worth of samples
+  // Each entry is one float sample
+  refQueue = xQueueCreate(BUFFER_SIZE * 8, sizeof(float));
+  errorQueue = xQueueCreate(BUFFER_SIZE * 8, sizeof(float));
+
+  if (refQueue == NULL || errorQueue == NULL) {
+    Serial.println("Failed to create queues");
+    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  }
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(
+    [](void*){
+      // Primary source task
+      const TickType_t xDelay = pdMS_TO_TICKS(1);
+      int16_t primary_buffer[BUFFER_SIZE * 2];
+      size_t bytes_written = 0;
+      while (1) {
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+          float primary_signal = generate_primary_signal();
+          // send reference to queue (non-blocking, drop if full)
+          xQueueSend(refQueue, &primary_signal, 0);
+
+          int16_t primary_output_int = (int16_t)(primary_signal * 16000.0f);
+          primary_buffer[i * 2] = primary_output_int;
+          primary_buffer[i * 2 + 1] = primary_output_int;
+        }
+        // Write batch to primary I2S
+        i2s_write(I2S_PRIMARY, primary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
+        // small delay to yield
+        vTaskDelay(xDelay);
+      }
+      vTaskDelete(NULL);
+    },
+    "PrimaryTask", 4096, NULL, 1, NULL, tskNO_AFFINITY
+  );
+
+  xTaskCreatePinnedToCore(
+    [](void*){
+      // Error microphone capture task
+      const TickType_t xDelay = pdMS_TO_TICKS(1);
+      while (1) {
+        // Capture a batch of ADC samples and push to queue
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+          float err = read_error_microphone();
+          // send to queue (non-blocking)
+          xQueueSend(errorQueue, &err, 0);
+        }
+        vTaskDelay(xDelay);
+      }
+      vTaskDelete(NULL);
+    },
+    "ErrorMicTask", 4096, NULL, 2, NULL, tskNO_AFFINITY
+  );
+
+  xTaskCreatePinnedToCore(
+    [](void*){
+      // Secondary source task: consumes reference+error, runs LMS, outputs anti-noise
+      int16_t secondary_buffer[BUFFER_SIZE * 2];
+      size_t bytes_written = 0;
+  // Buffers to hold a processing block
+  float ref_block[BUFFER_SIZE];
+  float err_block[BUFFER_SIZE];
+  // complex weight H for single-tone
+  std::complex<float> H = std::complex<float>(0.0f,0.0f);
+  // angular frequency
+  const float omega = 2.0f * M_PI * TARGET_FREQ;
+  // Local sample counter used to create time vector for basis
+  uint32_t local_sample_index = 0;
+      while (1) {
+        // Collect one block of reference and error samples (blocking)
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+          float reference = 0.0f;
+          float err = 0.0f;
+          xQueueReceive(refQueue, &reference, portMAX_DELAY);
+          xQueueReceive(errorQueue, &err, portMAX_DELAY);
+          ref_block[i] = reference;
+          err_block[i] = err;
+        }
+
+        // Build scalar Gram value denom = sum_n |R_n|^2 and rhs = -sum_n conj(R_n)*e_n
+        std::complex<float> rhs = std::complex<float>(0.0f, 0.0f);
+        float denom = 0.0f;
+        for (int n = 0; n < BUFFER_SIZE; n++) {
+          float t = (float)(local_sample_index + n) / (float)SAMPLE_RATE;
+          float phase = omega * t;
+          std::complex<float> Rn = std::complex<float>(cosf(phase), sinf(phase));
+          denom += std::norm(Rn); // =1 but keep for clarity
+          rhs += std::conj(Rn) * std::complex<float>(err_block[n], 0.0f);
+        }
+
+        // rhs = -R^H e
+        rhs = -rhs;
+
+        // Regularize denom
+        float denom_reg = denom + lambda_reg * (float)BUFFER_SIZE;
+        if (denom_reg == 0.0f) denom_reg = 1e-12f;
+
+        // Solve for scalar H
+        H = rhs / std::complex<float>(denom_reg, 0.0f);
+
+        // Synthesize secondary output for the block: y[n] = real(H * e^{j omega t})
+        for (int n = 0; n < BUFFER_SIZE; n++) {
+          float t = (float)(local_sample_index + n) / (float)SAMPLE_RATE;
+          float phase = omega * t;
+          std::complex<float> Rn = std::complex<float>(cosf(phase), sinf(phase));
+          std::complex<float> ycnv = H * Rn;
+          float sec_out = std::real(ycnv);
+          int16_t secondary_output_int = (int16_t)(sec_out * 16000.0f);
+          secondary_buffer[n * 2] = secondary_output_int;
+          secondary_buffer[n * 2 + 1] = secondary_output_int;
+          // Update telemetry
+          secondary_output = sec_out;
+          error_signal = err_block[n];
+        }
+
+        // Write batch to secondary I2S
+        i2s_write(I2S_SECONDARY, secondary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
+
+        // advance local sample index
+        local_sample_index += BUFFER_SIZE;
+
+        // Yield
+        vTaskDelay(pdMS_TO_TICKS(1));
+      }
+      vTaskDelete(NULL);
+    },
+    "SecondaryTask", 8192, NULL, 2, NULL, tskNO_AFFINITY
+  );
+
+  Serial.println("FreeRTOS tasks created");
 }
 
 // ============= Main Loop =============
 void loop() {
-  int16_t primary_buffer[BUFFER_SIZE * 2];    // Buffer for primary source (mono in stereo format)
-  int16_t secondary_buffer[BUFFER_SIZE * 2];  // Buffer for secondary source (mono in stereo format)
-  size_t bytes_written;
-  
-  // Process audio in batches
-  for (int i = 0; i < BUFFER_SIZE; i++) {
-    // Step 1: Generate primary noise signal (reference)
-    float primary_signal = generate_primary_signal();
-    
-    // Step 2: Apply LMS filter to generate anti-noise signal
-    secondary_output = lms_filter(primary_signal);
-    
-    // Step 3: Read error microphone
-    // The error microphone captures: primary_signal + secondary_output (acoustic superposition)
-    error_signal = read_error_microphone();
-    
-    // Step 4: Update LMS weights based on error
-    update_lms_weights(error_signal, primary_signal);
-    
-    // Step 5: Prepare I2S outputs
-    int16_t primary_output_int = (int16_t)(primary_signal * 16000.0);
-    int16_t secondary_output_int = (int16_t)(secondary_output * 16000.0);
-    
-    // Fill buffers (mono signal on both L+R channels for compatibility)
-    primary_buffer[i * 2] = primary_output_int;
-    primary_buffer[i * 2 + 1] = primary_output_int;
-    
-    secondary_buffer[i * 2] = secondary_output_int;
-    secondary_buffer[i * 2 + 1] = secondary_output_int;
-  }
-  
-  // Write to both I2S interfaces
-  i2s_write(I2S_PRIMARY, primary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
-  i2s_write(I2S_SECONDARY, secondary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
-  
-  // Debug output every 1000 samples (~22ms at 44.1kHz)
+  // All work is handled by FreeRTOS tasks. Idle here.
   static int debug_counter = 0;
   debug_counter++;
   if (debug_counter >= 1000) {
@@ -235,4 +344,5 @@ void loop() {
     Serial.println(lms_weights[0], 4);
     debug_counter = 0;
   }
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
