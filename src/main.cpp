@@ -1,348 +1,202 @@
 #include <Arduino.h>
-#include <driver/i2s.h>
-#include <driver/adc.h>
-#include <math.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/queue.h>
-#include <complex>
+#include "driver/i2s.h"
 
-// ============= Configuration Parameters =============
-#define SAMPLE_RATE 44100          // Sample rate in Hz
-#define BUFFER_SIZE 256            // Buffer size for processing
-#define LMS_FILTER_LENGTH 128      // Length of adaptive filter
-#define LMS_MU 0.001               // LMS step size (learning rate)
-#define PRIMARY_FREQ 1000.0        // Primary noise frequency (1 kHz)
-#define TWO_PI 6.283185307179586   
+// ----------- User-tunable ANC params -----------
+static const uint32_t FS_HZ        = 44100;
+static const uint16_t FRAME        = 64;       // block size
+static const float    F0_HZ        = 1000.0f;  // primary tone
+static const int      N_TAPS       = 64;       // ANC FIR length (control filter)
+static const int      S_DELAY      = 12;       // samples of secondary-path delay (start ~ 10–20)
+static const float    MU           = 2.5e-7f;  // LMS step size (start tiny; increase cautiously)
+static const float    LEAK         = 0.0f;     // optional leaky FXLMS (0..1); 0 = off
+static const float    OUT_CLIP     = 0.95f;    // clip before I2S (±1.0 full-scale)
+static const int      HPF_DC_N     = 1024;     // simple DC remover length for mic
 
-// ============= I2S Configuration =============
-// Primary Source (I2S_NUM_0) - Plays the known noise signal
-#define I2S_PRIMARY I2S_NUM_0
-#define I2S_PRIMARY_BCK_PIN 26     // Bit clock pin for primary
-#define I2S_PRIMARY_WS_PIN 27      // Word select pin for primary
-#define I2S_PRIMARY_DATA_PIN 25    // Data out pin for primary speaker
+// ----------- Pins (your mapping) ---------------
+static const i2s_port_t I2S_PRIMARY   = I2S_NUM_0;   // primary (noise) speaker
+static const i2s_port_t I2S_SECONDARY = I2S_NUM_1;   // secondary (anti-noise) speaker
+// MAX98357 #1 (primary)
+static const int BCK1 = 26;
+static const int WS1  = 27;
+static const int DIN1 = 25;
+// MAX98357 #2 (secondary)
+static const int BCK2 = 33;
+static const int WS2  = 14;
+static const int DIN2 = 32;
 
-// Secondary Source (I2S_NUM_1) - Plays the anti-noise signal
-#define I2S_SECONDARY I2S_NUM_1
-#define I2S_SECONDARY_BCK_PIN 33   // Bit clock pin for secondary
-#define I2S_SECONDARY_WS_PIN 14    // Word select pin for secondary
-#define I2S_SECONDARY_DATA_PIN 32  // Data out pin for secondary speaker
+// ----------- Fixed-point/I2S helpers -----------
+static inline int16_t f32_to_i16(float x) {
+  // hard clip to [-1, 1], then scale
+  if (x >  1.0f) x =  1.0f;
+  if (x < -1.0f) x = -1.0f;
+  return (int16_t)(x * 32767.0f);
+}
 
-// ============= ADC Configuration =============
-#define ERROR_MIC_PIN ADC1_CHANNEL_0  // GPIO36 for error microphone
-#define ADC_SAMPLES 128            // Number of ADC samples per batch
+// Simple 1st-order DC remover (moving average) for mic
+struct DCRemover {
+  float acc = 0.0f;
+  int   n   = 0;
+  void   reset(){ acc=0.0f; n=0; }
+  float  step(float x){
+    // incremental mean (Welford simplified for mean only)
+    n = min(n+1, HPF_DC_N);
+    acc += (x - acc) / (float)n;
+    return x - acc;
+  }
+} dc;
 
-// ============= Global Variables =============
-float lms_weights[LMS_FILTER_LENGTH];     // LMS filter coefficients
-float reference_buffer[LMS_FILTER_LENGTH]; // Reference signal buffer
-float error_signal = 0.0;                  // Current error signal
-float secondary_output = 0.0;              // Anti-noise signal
-uint32_t sample_count = 0;                 // Sample counter for sine generation
+// ----------- ANC state -----------
+static float w[N_TAPS];            // control filter coefficients
+static float xBuf[N_TAPS + 256];   // ring buffer for reference (pad for simplicity)
+static float xfBuf[N_TAPS + 256];  // filtered-x (here delay-only)
+static int   idx = 0;              // ring index
 
-// FreeRTOS objects for inter-task communication
-static QueueHandle_t refQueue = NULL;    // Queue of float reference samples
-static QueueHandle_t errorQueue = NULL;  // Queue of float error samples
+// phase accumulator for 1 kHz
+static double phase = 0.0;
+static const double TWOPI = 6.283185307179586;
+static double dphi;
 
-// Single-tone least-squares configuration (target 1000 Hz)
-const float TARGET_FREQ = 1000.0f; // Hz to cancel
-const float lambda_reg = 1e-3f; // Tikhonov regularization
-
-// ============= Function Prototypes =============
-void setup_i2s_primary();
-void setup_i2s_secondary();
-void setup_adc();
-float generate_primary_signal();
-float read_error_microphone();
-float lms_filter(float reference);
-void update_lms_weights(float error, float reference);
-
-// ============= Setup I2S for Primary Source =============
-void setup_i2s_primary() {
-  i2s_config_t i2s_config = {
+// ----------- I2S setup -----------
+void setup_i2s_tx(i2s_port_t port, int bck, int ws, int din) {
+  i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
+    .sample_rate = (int)FS_HZ,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // Mono output
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // MAX98357 wants stereo LR; we'll duplicate mono
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
-    .dma_buf_len = BUFFER_SIZE,
+    .dma_buf_len = FRAME,
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
   };
+  i2s_driver_install(port, &cfg, 0, nullptr);
 
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_PRIMARY_BCK_PIN,
-    .ws_io_num = I2S_PRIMARY_WS_PIN,
-    .data_out_num = I2S_PRIMARY_DATA_PIN,
+  i2s_pin_config_t pins = {
+    .bck_io_num = bck,
+    .ws_io_num = ws,
+    .data_out_num = din,
     .data_in_num = I2S_PIN_NO_CHANGE
   };
-
-  // Install and start I2S driver for primary
-  i2s_driver_install(I2S_PRIMARY, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PRIMARY, &pin_config);
-  i2s_zero_dma_buffer(I2S_PRIMARY);
+  i2s_set_pin(port, &pins);
+  i2s_set_clk(port, FS_HZ, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 }
 
-// ============= Setup I2S for Secondary Source =============
-void setup_i2s_secondary() {
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // Mono output
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = BUFFER_SIZE,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
-  };
-
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SECONDARY_BCK_PIN,
-    .ws_io_num = I2S_SECONDARY_WS_PIN,
-    .data_out_num = I2S_SECONDARY_DATA_PIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-
-  // Install and start I2S driver for secondary
-  i2s_driver_install(I2S_SECONDARY, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_SECONDARY, &pin_config);
-  i2s_zero_dma_buffer(I2S_SECONDARY);
-}
-
-// ============= Setup ADC for Microphone Input =============
-void setup_adc() {
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ERROR_MIC_PIN, ADC_ATTEN_DB_11);
-}
-
-// ============= Generate Primary Noise Signal =============
-// Generates sin(2*pi*1000*t)
-float generate_primary_signal() {
-  float t = (float)sample_count / (float)SAMPLE_RATE;
-  float signal = sin(TWO_PI * PRIMARY_FREQ * t);
-  sample_count++;
-  return signal;
-}
-
-// ============= Read Error Microphone Signal =============
-float read_error_microphone() {
-  // Read ADC value (0-4095 for 12-bit)
-  int adc_value = adc1_get_raw(ERROR_MIC_PIN);
-  
-  // Convert to normalized float (-1.0 to 1.0)
-  float normalized = ((float)adc_value - 2048.0) / 2048.0;
-  
-  return normalized;
-}
-
-// ============= LMS Adaptive Filter =============
-// Computes the filter output y(n) = sum(w[i] * x[n-i])
-float lms_filter(float reference) {
-  // Shift reference buffer (FIFO)
-  for (int i = LMS_FILTER_LENGTH - 1; i > 0; i--) {
-    reference_buffer[i] = reference_buffer[i - 1];
+void write_i2s_mono_stereo(i2s_port_t port, const int16_t* mono, size_t n) {
+  // duplicate mono to L and R
+  static int16_t interleaved[FRAME * 2];
+  for (size_t i = 0; i < n; ++i) {
+    interleaved[2*i + 0] = mono[i];
+    interleaved[2*i + 1] = mono[i];
   }
-  reference_buffer[0] = reference;
-  
-  // Compute filter output
-  float output = 0.0;
-  for (int i = 0; i < LMS_FILTER_LENGTH; i++) {
-    output += lms_weights[i] * reference_buffer[i];
-  }
-  
-  return output;
+  size_t bytesWritten = 0;
+  i2s_write(port, interleaved, n * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
 }
 
-// ============= Update LMS Filter Weights =============
-// Updates weights using: w(n+1) = w(n) + mu * e(n) * x(n)
-void update_lms_weights(float error, float reference) {
-  for (int i = 0; i < LMS_FILTER_LENGTH; i++) {
-    lms_weights[i] += LMS_MU * error * reference_buffer[i];
-    
-    // Optional: Add weight constraints to prevent divergence
-    if (lms_weights[i] > 10.0) lms_weights[i] = 10.0;
-    if (lms_weights[i] < -10.0) lms_weights[i] = -10.0;
-  }
+// ----------- ADC (mic on GPIO39) -----------
+static const int MIC_PIN = 39; // ADC1_CH3
+
+inline float read_mic_norm() {
+  // 12-bit ADC: 0..4095; center around 0 and normalize to ±1
+  int raw = analogRead(MIC_PIN);
+  float x = (float)raw;
+  // Map 0..4095 -> -1..+1 (center ~ 2048), also light scaling to avoid clipping
+  return ( (x - 2048.0f) / 2048.0f );
 }
 
-// ============= Setup Function =============
+// ----------- ANC core (block processing) -----------
+void anc_process_block() {
+  int16_t bufPrimary[FRAME]  = {0}; // to primary I2S (the "noise")
+  int16_t bufSecondary[FRAME]= {0}; // to secondary I2S (the anti-noise)
+
+  for (int n = 0; n < FRAME; ++n) {
+    // 1) Generate primary reference x[n] = sin(2π f0 t)
+    float x = (float)sin(phase);
+    phase += dphi;
+    if (phase >= TWOPI) phase -= TWOPI;
+
+    // 2) Push reference into ring buffer
+    xBuf[idx] = x;
+
+    // 3) Generate control output y[n] = sum_k w[k] * x[n-k]
+    float y = 0.0f;
+    int j = idx;
+    for (int k = 0; k < N_TAPS; ++k) {
+      // ring index (wrap)
+      int jj = j - k;
+      if (jj < 0) jj += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
+      y += w[k] * xBuf[jj];
+    }
+
+    // 4) Play signals: primary (x scaled) and secondary (y)
+    float primary_out = 0.50f * x;   // make primary smaller to avoid clipping
+    float secondary_out = y;
+
+    // Clip before convert
+    if (primary_out  >  OUT_CLIP) primary_out  =  OUT_CLIP;
+    if (primary_out  < -OUT_CLIP) primary_out  = -OUT_CLIP;
+    if (secondary_out>  OUT_CLIP) secondary_out=  OUT_CLIP;
+    if (secondary_out< -OUT_CLIP) secondary_out= -OUT_CLIP;
+
+    bufPrimary[n]   = f32_to_i16(primary_out);
+    bufSecondary[n] = f32_to_i16(secondary_out);
+
+    // 5) Measure error mic (residual at ear)
+    float e = read_mic_norm();
+    e = dc.step(e);     // remove DC drift
+
+    // 6) Filtered-X ref: delay-only model (x_f[n] = x[n - S_DELAY])
+    int jdel = idx - S_DELAY;
+    if (jdel < 0) jdel += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
+    float xf = xBuf[jdel];
+
+    // 7) LMS weight update: w[k] += mu * e[n] * x_f[n-k] - leak*w[k]
+    int jf = jdel;
+    for (int k = 0; k < N_TAPS; ++k) {
+      int jjf = jf - k;
+      if (jjf < 0) jjf += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
+      float xfk = xBuf[jjf];                 // because filtered-x == delayed x
+      w[k] = (1.0f - LEAK) * w[k] + MU * e * xfk;
+    }
+
+    // 8) advance ring index
+    idx++;
+    if (idx >= (int)(sizeof(xBuf)/sizeof(xBuf[0]))) idx = 0;
+  }
+
+  // 9) push out blocks to I2S
+  write_i2s_mono_stereo(I2S_PRIMARY,   bufPrimary,   FRAME);
+  write_i2s_mono_stereo(I2S_SECONDARY, bufSecondary, FRAME);
+}
+
+// ----------- Setup & loop -----------
 void setup() {
+  // Serial just for debug
   Serial.begin(115200);
-  Serial.println("=== ESP32 ANC System Initializing ===");
-  
-  // Initialize I2S for primary source (noise generator)
-  setup_i2s_primary();
-  Serial.println("I2S Primary initialized");
-  
-  // Initialize I2S for secondary source (anti-noise)
-  setup_i2s_secondary();
-  Serial.println("I2S Secondary initialized");
-  
-  // Initialize ADC for microphone input
-  setup_adc();
-  Serial.println("ADC initialized");
-  
-  // Initialize LMS filter weights to zero
-  for (int i = 0; i < LMS_FILTER_LENGTH; i++) {
-    lms_weights[i] = 0.0;
-    reference_buffer[i] = 0.0;
-  }
-  Serial.println("LMS filter initialized");
-  
-  Serial.println("=== ANC System Ready ===");
-  delay(1000);
+  delay(200);
 
-  // Create queues: hold a few buffers worth of samples
-  // Each entry is one float sample
-  refQueue = xQueueCreate(BUFFER_SIZE * 8, sizeof(float));
-  errorQueue = xQueueCreate(BUFFER_SIZE * 8, sizeof(float));
+  // ADC
+  analogReadResolution(12);
+  // (Optionally) analogSetPinAttenuation(MIC_PIN, ADC_11db);
 
-  if (refQueue == NULL || errorQueue == NULL) {
-    Serial.println("Failed to create queues");
-    while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
-  }
+  // I2S
+  setup_i2s_tx(I2S_PRIMARY,   BCK1, WS1, DIN1);
+  setup_i2s_tx(I2S_SECONDARY, BCK2, WS2, DIN2);
 
-  // Create FreeRTOS tasks
-  xTaskCreatePinnedToCore(
-    [](void*){
-      // Primary source task
-      const TickType_t xDelay = pdMS_TO_TICKS(1);
-      int16_t primary_buffer[BUFFER_SIZE * 2];
-      size_t bytes_written = 0;
-      while (1) {
-        for (int i = 0; i < BUFFER_SIZE; i++) {
-          float primary_signal = generate_primary_signal();
-          // send reference to queue (non-blocking, drop if full)
-          xQueueSend(refQueue, &primary_signal, 0);
+  // Init ANC state
+  memset(w, 0, sizeof(w));
+  memset(xBuf, 0, sizeof(xBuf));
+  idx = 0;
+  dc.reset();
 
-          int16_t primary_output_int = (int16_t)(primary_signal * 16000.0f);
-          primary_buffer[i * 2] = primary_output_int;
-          primary_buffer[i * 2 + 1] = primary_output_int;
-        }
-        // Write batch to primary I2S
-        i2s_write(I2S_PRIMARY, primary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
-        // small delay to yield
-        vTaskDelay(xDelay);
-      }
-      vTaskDelete(NULL);
-    },
-    "PrimaryTask", 4096, NULL, 1, NULL, tskNO_AFFINITY
-  );
+  // Phase increment for 1 kHz
+  dphi = TWOPI * (double)F0_HZ / (double)FS_HZ;
 
-  xTaskCreatePinnedToCore(
-    [](void*){
-      // Error microphone capture task
-      const TickType_t xDelay = pdMS_TO_TICKS(1);
-      while (1) {
-        // Capture a batch of ADC samples and push to queue
-        for (int i = 0; i < BUFFER_SIZE; i++) {
-          float err = read_error_microphone();
-          // send to queue (non-blocking)
-          xQueueSend(errorQueue, &err, 0);
-        }
-        vTaskDelay(xDelay);
-      }
-      vTaskDelete(NULL);
-    },
-    "ErrorMicTask", 4096, NULL, 2, NULL, tskNO_AFFINITY
-  );
-
-  xTaskCreatePinnedToCore(
-    [](void*){
-      // Secondary source task: consumes reference+error, runs LMS, outputs anti-noise
-      int16_t secondary_buffer[BUFFER_SIZE * 2];
-      size_t bytes_written = 0;
-  // Buffers to hold a processing block
-  float ref_block[BUFFER_SIZE];
-  float err_block[BUFFER_SIZE];
-  // complex weight H for single-tone
-  std::complex<float> H = std::complex<float>(0.0f,0.0f);
-  // angular frequency
-  const float omega = 2.0f * M_PI * TARGET_FREQ;
-  // Local sample counter used to create time vector for basis
-  uint32_t local_sample_index = 0;
-      while (1) {
-        // Collect one block of reference and error samples (blocking)
-        for (int i = 0; i < BUFFER_SIZE; i++) {
-          float reference = 0.0f;
-          float err = 0.0f;
-          xQueueReceive(refQueue, &reference, portMAX_DELAY);
-          xQueueReceive(errorQueue, &err, portMAX_DELAY);
-          ref_block[i] = reference;
-          err_block[i] = err;
-        }
-
-        // Build scalar Gram value denom = sum_n |R_n|^2 and rhs = -sum_n conj(R_n)*e_n
-        std::complex<float> rhs = std::complex<float>(0.0f, 0.0f);
-        float denom = 0.0f;
-        for (int n = 0; n < BUFFER_SIZE; n++) {
-          float t = (float)(local_sample_index + n) / (float)SAMPLE_RATE;
-          float phase = omega * t;
-          std::complex<float> Rn = std::complex<float>(cosf(phase), sinf(phase));
-          denom += std::norm(Rn); // =1 but keep for clarity
-          rhs += std::conj(Rn) * std::complex<float>(err_block[n], 0.0f);
-        }
-
-        // rhs = -R^H e
-        rhs = -rhs;
-
-        // Regularize denom
-        float denom_reg = denom + lambda_reg * (float)BUFFER_SIZE;
-        if (denom_reg == 0.0f) denom_reg = 1e-12f;
-
-        // Solve for scalar H
-        H = rhs / std::complex<float>(denom_reg, 0.0f);
-
-        // Synthesize secondary output for the block: y[n] = real(H * e^{j omega t})
-        for (int n = 0; n < BUFFER_SIZE; n++) {
-          float t = (float)(local_sample_index + n) / (float)SAMPLE_RATE;
-          float phase = omega * t;
-          std::complex<float> Rn = std::complex<float>(cosf(phase), sinf(phase));
-          std::complex<float> ycnv = H * Rn;
-          float sec_out = std::real(ycnv);
-          int16_t secondary_output_int = (int16_t)(sec_out * 16000.0f);
-          secondary_buffer[n * 2] = secondary_output_int;
-          secondary_buffer[n * 2 + 1] = secondary_output_int;
-          // Update telemetry
-          secondary_output = sec_out;
-          error_signal = err_block[n];
-        }
-
-        // Write batch to secondary I2S
-        i2s_write(I2S_SECONDARY, secondary_buffer, BUFFER_SIZE * 4, &bytes_written, portMAX_DELAY);
-
-        // advance local sample index
-        local_sample_index += BUFFER_SIZE;
-
-        // Yield
-        vTaskDelay(pdMS_TO_TICKS(1));
-      }
-      vTaskDelete(NULL);
-    },
-    "SecondaryTask", 8192, NULL, 2, NULL, tskNO_AFFINITY
-  );
-
-  Serial.println("FreeRTOS tasks created");
+  Serial.println("ANC (FXLMS, delay-only S^) starting…");
 }
 
-// ============= Main Loop =============
 void loop() {
-  // All work is handled by FreeRTOS tasks. Idle here.
-  static int debug_counter = 0;
-  debug_counter++;
-  if (debug_counter >= 1000) {
-    Serial.print("Error: ");
-    Serial.print(error_signal, 4);
-    Serial.print(" | Secondary: ");
-    Serial.print(secondary_output, 4);
-    Serial.print(" | Weight[0]: ");
-    Serial.println(lms_weights[0], 4);
-    debug_counter = 0;
-  }
-  vTaskDelay(pdMS_TO_TICKS(10));
+  anc_process_block();   // real-time block processing
+  // (No delay; runs at I2S DMA pace.)
 }
