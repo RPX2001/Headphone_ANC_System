@@ -271,13 +271,12 @@ void setup() {
 
   // ADC
   analogReadResolution(12);
-  // (Optionally) analogSetPinAttenuation(MIC_PIN, ADC_11db);
-
+  
   // I2S
   setup_i2s_tx(I2S_PRIMARY,   BCK1, WS1, DIN1);
   setup_i2s_tx(I2S_SECONDARY, BCK2, WS2, DIN2);
 
-  // Try to load previous state from NVS
+  // load previous state from NVS
   bool loaded = load_from_nvs();
   
   if (!loaded) {
@@ -304,5 +303,5 @@ void setup() {
 
 void loop() {
   anc_process_block();   // real-time block processing
-  // (No delay; runs at I2S DMA pace.)
+  // (runs at I2S DMA pace.)
 }
