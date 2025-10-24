@@ -2,7 +2,7 @@
 #include "driver/i2s.h"
 #include <Preferences.h>
 
-// ----------- User-tunable ANC params (SIMPLIFIED LMS) -----------
+// ----------- tunable ANC params (SIMPLIFIED LMS) -----------
 static const uint32_t FS_HZ        = 44100;
 static const uint16_t FRAME        = 64;       // block size
 static const float    F0_HZ        = 1000.0f;  // primary tone (known signal to cancel)
