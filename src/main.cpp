@@ -1,14 +1,14 @@
 #include <Arduino.h>
 #include "driver/i2s.h"
+#include <Preferences.h>
 
-// ----------- User-tunable ANC params -----------
+// ----------- User-tunable ANC params (SIMPLIFIED LMS) -----------
 static const uint32_t FS_HZ        = 44100;
 static const uint16_t FRAME        = 64;       // block size
-static const float    F0_HZ        = 1000.0f;  // primary tone
-static const int      N_TAPS       = 64;       // ANC FIR length (control filter)
-static const int      S_DELAY      = 12;       // samples of secondary-path delay (start ~ 10–20)
-static const float    MU           = 2.5e-7f;  // LMS step size (start tiny; increase cautiously)
-static const float    LEAK         = 0.0f;     // optional leaky FXLMS (0..1); 0 = off
+static const float    F0_HZ        = 1000.0f;  // primary tone (known signal to cancel)
+static const int      N_TAPS       = 32;       // LMS FIR length (reduced for single tone)
+static const float    MU           = 0.005f;  // LMS step size (tune for convergence)
+static const float    LEAK         = 0.0f;     // optional leaky LMS (0..1); 0 = off
 static const float    OUT_CLIP     = 0.95f;    // clip before I2S (±1.0 full-scale)
 static const int      HPF_DC_N     = 1024;     // simple DC remover length for mic
 
@@ -45,16 +45,80 @@ struct DCRemover {
   }
 } dc;
 
-// ----------- ANC state -----------
-static float w[N_TAPS];            // control filter coefficients
-static float xBuf[N_TAPS + 256];   // ring buffer for reference (pad for simplicity)
-static float xfBuf[N_TAPS + 256];  // filtered-x (here delay-only)
+// ----------- ANC state (SIMPLIFIED LMS) -----------
+static float w[N_TAPS];            // LMS filter coefficients
+static float xBuf[N_TAPS + 256];   // ring buffer for reference signal
 static int   idx = 0;              // ring index
 
 // phase accumulator for 1 kHz
 static double phase = 0.0;
 static const double TWOPI = 6.283185307179586;
 static double dphi;
+
+// ----------- Non-Volatile Storage -----------
+Preferences preferences;
+static const char* NVS_NAMESPACE = "anc_data";
+static const char* NVS_WEIGHTS_KEY = "weights";
+static const char* NVS_PHASE_KEY = "phase";
+static const char* NVS_VALID_KEY = "valid";
+static unsigned long last_save_time = 0;
+static const unsigned long SAVE_INTERVAL_MS = 10000; // Save every 10 seconds
+
+// Save weights and signal parameters to NVS
+void save_to_nvs() {
+  preferences.begin(NVS_NAMESPACE, false); // Read/Write mode
+  
+  // Save weights array
+  preferences.putBytes(NVS_WEIGHTS_KEY, w, sizeof(w));
+  
+  // Save phase accumulator (for signal continuity)
+  preferences.putDouble(NVS_PHASE_KEY, phase);
+  
+  // Mark as valid
+  preferences.putBool(NVS_VALID_KEY, true);
+  
+  preferences.end();
+  Serial.println("ANC state saved to NVS");
+}
+
+// Load weights and signal parameters from NVS
+bool load_from_nvs() {
+  preferences.begin(NVS_NAMESPACE, true); // Read-only mode
+  
+  // Check if valid data exists
+  bool valid = preferences.getBool(NVS_VALID_KEY, false);
+  
+  if (valid) {
+    // Load weights
+    size_t len = preferences.getBytes(NVS_WEIGHTS_KEY, w, sizeof(w));
+    
+    // Load phase
+    phase = preferences.getDouble(NVS_PHASE_KEY, 0.0);
+    
+    preferences.end();
+    
+    if (len == sizeof(w)) {
+      Serial.println("ANC state loaded from NVS");
+      Serial.print("Restored phase: ");
+      Serial.println(phase, 6);
+      Serial.print("Restored W[0]: ");
+      Serial.println(w[0], 6);
+      return true;
+    }
+  }
+  
+  preferences.end();
+  Serial.println("No valid ANC state found in NVS - starting fresh");
+  return false;
+}
+
+// Clear NVS data (optional, for debugging)
+void clear_nvs() {
+  preferences.begin(NVS_NAMESPACE, false);
+  preferences.clear();
+  preferences.end();
+  Serial.println("NVS cleared");
+}
 
 // ----------- I2S setup -----------
 void setup_i2s_tx(i2s_port_t port, int bck, int ws, int din) {
@@ -105,10 +169,14 @@ inline float read_mic_norm() {
   return ( (x - 2048.0f) / 2048.0f );
 }
 
-// ----------- ANC core (block processing) -----------
+// ----------- ANC core (SIMPLIFIED LMS - No Filtered-X) -----------
 void anc_process_block() {
   int16_t bufPrimary[FRAME]  = {0}; // to primary I2S (the "noise")
   int16_t bufSecondary[FRAME]= {0}; // to secondary I2S (the anti-noise)
+  
+  static int print_counter = 0;      // for periodic serial printing
+  static float error_avg = 0.0f;     // average error for this block
+  static float output_avg = 0.0f;    // average output for this block
 
   for (int n = 0; n < FRAME; ++n) {
     // 1) Generate primary reference x[n] = sin(2π f0 t)
@@ -146,28 +214,53 @@ void anc_process_block() {
     float e = read_mic_norm();
     e = dc.step(e);     // remove DC drift
 
-    // 6) Filtered-X ref: delay-only model (x_f[n] = x[n - S_DELAY])
-    int jdel = idx - S_DELAY;
-    if (jdel < 0) jdel += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
-    float xf = xBuf[jdel];
+    // Accumulate for averaging
+    error_avg += fabs(e);
+    output_avg += fabs(secondary_out);
 
-    // 7) LMS weight update: w[k] += mu * e[n] * x_f[n-k] - leak*w[k]
-    int jf = jdel;
+    // 6) SIMPLIFIED LMS weight update: w[k] += mu * e[n] * x[n-k] - leak*w[k]
+    //    No filtered-x needed since we have the exact reference signal
+    int jx = idx;
     for (int k = 0; k < N_TAPS; ++k) {
-      int jjf = jf - k;
-      if (jjf < 0) jjf += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
-      float xfk = xBuf[jjf];                 // because filtered-x == delayed x
-      w[k] = (1.0f - LEAK) * w[k] + MU * e * xfk;
+      int jj = jx - k;
+      if (jj < 0) jj += (int)(sizeof(xBuf)/sizeof(xBuf[0]));
+      float xk = xBuf[jj];
+      w[k] = (1.0f - LEAK) * w[k] + MU * e * xk;
     }
 
-    // 8) advance ring index
+    // 7) advance ring index
     idx++;
     if (idx >= (int)(sizeof(xBuf)/sizeof(xBuf[0]))) idx = 0;
   }
 
-  // 9) push out blocks to I2S
+  // 8) push out blocks to I2S
   write_i2s_mono_stereo(I2S_PRIMARY,   bufPrimary,   FRAME);
   write_i2s_mono_stereo(I2S_SECONDARY, bufSecondary, FRAME);
+
+  // 9) Print to serial every ~100ms (at 44.1kHz with FRAME=64, ~689 blocks/sec)
+  print_counter++;
+  if (print_counter >= 70) {  // ~70 blocks ≈ 100ms
+    error_avg /= (float)(FRAME * 70);
+    output_avg /= (float)(FRAME * 70);
+    
+    Serial.print("Error(avg): ");
+    Serial.print(error_avg, 6);
+    Serial.print(" | Output(avg): ");
+    Serial.print(output_avg, 6);
+    Serial.print(" | W[0]: ");
+    Serial.println(w[0], 6);
+    
+    print_counter = 0;
+    error_avg = 0.0f;
+    output_avg = 0.0f;
+  }
+  
+  // 10) Periodically save to NVS (every 10 seconds)
+  unsigned long current_time = millis();
+  if (current_time - last_save_time >= SAVE_INTERVAL_MS) {
+    save_to_nvs();
+    last_save_time = current_time;
+  }
 }
 
 // ----------- Setup & loop -----------
@@ -175,6 +268,7 @@ void setup() {
   // Serial just for debug
   Serial.begin(115200);
   delay(200);
+  Serial.println("=== ESP32 ANC System Starting ===");
 
   // ADC
   analogReadResolution(12);
@@ -184,16 +278,29 @@ void setup() {
   setup_i2s_tx(I2S_PRIMARY,   BCK1, WS1, DIN1);
   setup_i2s_tx(I2S_SECONDARY, BCK2, WS2, DIN2);
 
-  // Init ANC state
-  memset(w, 0, sizeof(w));
+  // Try to load previous state from NVS
+  bool loaded = load_from_nvs();
+  
+  if (!loaded) {
+    // Init ANC state from scratch
+    memset(w, 0, sizeof(w));
+    phase = 0.0;
+    Serial.println("Initialized with zero weights");
+  }
+  
+  // Always clear buffers and reset index
   memset(xBuf, 0, sizeof(xBuf));
   idx = 0;
   dc.reset();
 
   // Phase increment for 1 kHz
   dphi = TWOPI * (double)F0_HZ / (double)FS_HZ;
+  
+  // Initialize save timer
+  last_save_time = millis();
 
-  Serial.println("ANC (FXLMS, delay-only S^) starting…");
+  Serial.println("ANC (Simplified LMS) ready for 1kHz cancellation…");
+  Serial.println("Weights will auto-save every 10 seconds");
 }
 
 void loop() {
