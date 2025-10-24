@@ -262,7 +262,7 @@ void anc_process_block() {
   }
 }
 
-// ----------- Setup & loop -----------
+
 void setup() {
   // Serial just for debug
   Serial.begin(115200);
