@@ -8,7 +8,7 @@ static const uint16_t FRAME        = 64;       // block size
 static const float    F0_HZ        = 1000.0f;  // primary tone (known signal to cancel)
 static const int      N_TAPS       = 32;       // LMS FIR length (reduced for single tone)
 static const float    MU           = 0.005f;  // LMS step size (tune for convergence)
-static const float    LEAK         = 0.0f;     // optional leaky LMS (0..1); 0 = off
+static const float    LEAK         = 0.0f;     // leaky LMS (0..1); 0 = off
 static const float    OUT_CLIP     = 0.95f;    // clip before I2S (±1.0 full-scale)
 static const int      HPF_DC_N     = 1024;     // simple DC remover length for mic
 
