@@ -112,7 +112,7 @@ bool load_from_nvs() {
   return false;
 }
 
-// Clear NVS data (optional, for debugging)
+// Clear NVS data
 void clear_nvs() {
   preferences.begin(NVS_NAMESPACE, false);
   preferences.clear();
