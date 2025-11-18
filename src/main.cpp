@@ -17,6 +17,8 @@ void setup() {
     
     Serial.println("Starting microphone reading...");
     Serial.println("Format: Signal (normalized) | Raw ADC");
+
+    delay(2000);
 }
 
 void loop() {
@@ -32,6 +34,6 @@ void loop() {
     Serial.print(" | Raw: ");
     Serial.println(raw);
     
-    delay(10);  // Read at ~100Hz
+    delay(0.5);  // Read at ~100Hz
 }
 
