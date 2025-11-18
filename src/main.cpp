@@ -288,12 +288,6 @@ void setup() {
   // ADC
   analogReadResolution(12);
   
-  // Calibrate DC offset BEFORE starting I2S (during quiet period)
-  Serial.println("Calibrating DC offset (keep microphone quiet)...");
-  delay(500);
-  dc.calibrate();
-  delay(500);
-  
   // I2S
   setup_i2s_tx(I2S_PRIMARY,   BCK1, WS1, DIN1);
   setup_i2s_tx(I2S_SECONDARY, BCK2, WS2, DIN2);
@@ -311,6 +305,7 @@ void setup() {
   // Always clear buffers and reset index
   memset(xBuf, 0, sizeof(xBuf));
   idx = 0;
+  dc.reset();
 
   // Phase increment for 1 kHz
   dphi = TWOPI * (double)F0_HZ / (double)FS_HZ;
