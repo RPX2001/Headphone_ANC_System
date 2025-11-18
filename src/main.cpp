@@ -32,16 +32,32 @@ static inline int16_t f32_to_i16(float x) {
   return (int16_t)(x * 32767.0f);
 }
 
-// Simple 1st-order DC remover (moving average) for mic
+// Fixed DC offset calibration
 struct DCRemover {
-  float acc = 0.0f;
-  int   n   = 0;
-  void   reset(){ acc=0.0f; n=0; }
-  float  step(float x){
-    // incremental mean
-    n = min(n+1, HPF_DC_N);
-    acc += (x - acc) / (float)n;
-    return x - acc;
+  float dc_offset = 0.0f;
+  bool calibrated = false;
+  
+  void calibrate() {
+    // Measure DC offset during quiet period (no audio)
+    const int CAL_SAMPLES = 1000;
+    float sum = 0.0f;
+    for (int i = 0; i < CAL_SAMPLES; i++) {
+      int raw = analogRead(39);  // MIC_PIN
+      sum += (float)raw;
+      delayMicroseconds(100);
+    }
+    dc_offset = sum / (float)CAL_SAMPLES;
+    calibrated = true;
+    Serial.print("DC offset calibrated: ");
+    Serial.println(dc_offset);
+  }
+  
+  void reset() { calibrated = false; dc_offset = 0.0f; }
+  
+  float step(float x_raw_adc) {
+    // x_raw_adc is the raw ADC value (0-4095)
+    // Subtract fixed DC offset, then normalize
+    return ((x_raw_adc - dc_offset) / 2048.0f);
   }
 } dc;
 
@@ -162,11 +178,11 @@ void write_i2s_mono_stereo(i2s_port_t port, const int16_t* mono, size_t n) {
 static const int MIC_PIN = 39; // ADC1_CH3
 
 inline float read_mic_norm() {
-  // 12-bit ADC: center around 0 and normalize to ±1
+  // 12-bit ADC: read raw value
   int raw = analogRead(MIC_PIN);
   float x = (float)raw;
-  // Map 0..4095 -> -1..+1 
-  return ( (x - 2048.0f) / 2048.0f );
+  // DC removal will be applied by dc.step()
+  return x;
 }
 
 // -----LMS----------
@@ -211,8 +227,8 @@ void anc_process_block() {
     bufSecondary[n] = f32_to_i16(secondary_out);
 
     //Measure error mic (residual at ear)
-    float e = read_mic_norm();
-    e = dc.step(e);     // remove DC drift
+    float e_raw = read_mic_norm();
+    float e = dc.step(e_raw);     // remove fixed DC offset and normalize
 
     // Accumulate for averaging
     error_avg += fabs(e);
@@ -272,6 +288,12 @@ void setup() {
   // ADC
   analogReadResolution(12);
   
+  // Calibrate DC offset BEFORE starting I2S (during quiet period)
+  Serial.println("Calibrating DC offset (keep microphone quiet)...");
+  delay(500);
+  dc.calibrate();
+  delay(500);
+  
   // I2S
   setup_i2s_tx(I2S_PRIMARY,   BCK1, WS1, DIN1);
   setup_i2s_tx(I2S_SECONDARY, BCK2, WS2, DIN2);
@@ -289,7 +311,6 @@ void setup() {
   // Always clear buffers and reset index
   memset(xBuf, 0, sizeof(xBuf));
   idx = 0;
-  dc.reset();
 
   // Phase increment for 1 kHz
   dphi = TWOPI * (double)F0_HZ / (double)FS_HZ;
