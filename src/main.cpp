@@ -5,7 +5,7 @@
 MicInput mic;
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(250000);
     delay(200);
     Serial.println("=== ESP32 Microphone Test ===");
     
@@ -29,11 +29,12 @@ void loop() {
     int raw = mic.readRaw();
     
     // Print values
-    Serial.print("Signal: ");
+    //Serial.print("Signal: ");
     Serial.print(signal, 4);
-    Serial.print(" | Raw: ");
+    Serial.print(",");
     Serial.println(raw);
     
-    delay(0.5);  // Read at ~100Hz
+    delay(0.5);  // Read at ~2KHz
+    //delay(0.1);  // Read at ~10KHz
 }
 

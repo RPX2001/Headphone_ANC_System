@@ -5,7 +5,7 @@ import os
 # 1. SETUP: Create a dummy file for demonstration
 # (You can skip this part if you already have your real file)
 # ---------------------------------------------------------
-filename = "calibration_data.txt"
+filename = "calibration_data_1.txt"
 
 # ---------------------------------------------------------
 # 2. PARSING: Read the file and extract data
@@ -24,13 +24,13 @@ try:
         # Parse format: "Signal: -0.1952 | Raw: 592"
         try:
             # Split into ["Signal: -0.1952 ", " Raw: 592"]
-            parts = line.split('|')
+            parts = line.split(',')
             
             # Extract the number after the colon for Signal
-            sig_val = float(parts[0].split(':')[1].strip())
+            sig_val = float(parts[0])
             
             # Extract the number after the colon for Raw
-            raw_val = int(parts[1].split(':')[1].strip())
+            raw_val = int(parts[1])
             
             signals.append(sig_val)
             raw_values.append(raw_val)
