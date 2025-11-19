@@ -4,12 +4,12 @@ void MicInput::begin() {
     // Configure ADC resolution
     analogReadResolution(ADC_RESOLUTION);
     
-    // MAX4466 outputs 0-3.3V with DC bias at VCC/2 (~1.65V)
-    // Use 11dB attenuation to measure full 0-3.3V range properly
+    // Optional: Set attenuation for better dynamic range
+    // ADC_11db gives full scale voltage of ~3.3V
+    // Uncomment if needed:
     analogSetPinAttenuation(MIC_PIN, ADC_11db);
     
-    Serial.println("Microphone ADC initialized on GPIO34");
-    Serial.println("ADC range: 0-3.3V (11dB attenuation)");
+    Serial.println("Microphone ADC initialized on GPIO39");
 }
 
 void MicInput::calibrate() {
@@ -18,23 +18,27 @@ void MicInput::calibrate() {
     
     delay(500);  // Wait for environment to settle
     
-    int avg_offset = 0;
-    for (int j=0; j<3; j++) {
+    int avg = 0;
+    for (int j=0; j<3;j++){
         int sum = 0;
         for (int i = 0; i < CAL_SAMPLES; i++) {
             int raw = analogRead(MIC_PIN);
+            sum += raw;
             Serial.print(raw);
             Serial.print(" ");
-            sum += raw;
             delayMicroseconds(100);  // Small delay between samples
         }
-        avg_offset += int(sum/CAL_SAMPLES);  
+        
+        dc_offset = sum / CAL_SAMPLES;
+        Serial.println(dc_offset);
+        avg += dc_offset;
+        Serial.println(avg);
     }
-    dc_offset = int(avg_offset / 3);
+    dc_offset = avg/3;
     calibrated = true;
     
     Serial.print("DC offset calibrated: ");
-    Serial.println(dc_offset, 2);
+    Serial.println(dc_offset);
 }
 
 float MicInput::read() {

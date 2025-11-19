@@ -38,8 +38,15 @@ void loop() {
     // Example 1: Read raw microphone value
     // int raw = mic.readRaw();
     
-    // // Example 2: Read normalized microphone value (-1.0 to +1.0)
-    // float normalized = mic.read();
+    // Example 2: Read normalized microphone value (-1.0 to +1.0)
+    Serial.println("Mic Normalized: ");
+    for (int i=0; i<20; i++){
+        float normalized = mic.read();
+        Serial.print(normalized, 3);
+        Serial.print(" ");
+    }
+    
+
     
     // // Print every 100ms
     // static unsigned long lastPrint = 0;
@@ -64,5 +71,5 @@ void loop() {
     // phase = (phase + 32) % 80;
     // */
     
-    // delay(10);
+    delay(10);
 }
