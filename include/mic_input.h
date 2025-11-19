@@ -17,6 +17,12 @@ public:
     // Read raw ADC value (0-4095)
     int readRaw();
     
+    // Set manual DC offset
+    void setDCOffset(float offset) { dc_offset = offset; }
+    
+    // Set software gain to expand signal range
+    void setGain(float gain_val) { gain = gain_val; }
+    
     // Get DC offset value
     float getDCOffset() const { return dc_offset; }
     
@@ -29,6 +35,7 @@ private:
     static const int CAL_SAMPLES = 1000;  // Calibration samples
     
     float dc_offset = 2048.0f;  // Default center value
+    float gain = 1.0f;          // Software gain multiplier
     bool calibrated = false;
 };
 

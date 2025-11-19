@@ -7,7 +7,7 @@ void MicInput::begin() {
     // Optional: Set attenuation for better dynamic range
     // ADC_11db gives full scale voltage of ~3.3V
     // Uncomment if needed:
-    // analogSetPinAttenuation(MIC_PIN, ADC_11db);
+    analogSetPinAttenuation(MIC_PIN, ADC_11db);
     
     Serial.println("Microphone ADC initialized on GPIO39");
 }
@@ -36,9 +36,8 @@ float MicInput::read() {
     int raw = analogRead(MIC_PIN);
     
     // Remove DC offset and normalize to ±1.0
-    // ADC range is 0-4095 for 12-bit
-    // Center should be at dc_offset (typically ~2048)
-    float normalized = ((float)raw - dc_offset) / 2048.0f;
+    // Apply software gain to expand the signal
+    float normalized = ((float)raw - dc_offset) * gain / 2048.0f;
     
     // Clamp to ±1.0 range
     if (normalized > 1.0f) normalized = 1.0f;
