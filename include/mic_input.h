@@ -30,12 +30,12 @@ public:
     bool isCalibrated() const { return calibrated; }
 
 private:
-    static const int MIC_PIN = 34;        // GPIO34 = ADC1_CH6
+    static const int MIC_PIN = 39;        // GPIO39 = ADC1_CH6
     static const int ADC_RESOLUTION = 12; // 12-bit ADC (0-4095)
     static const int CAL_SAMPLES = 1000;  // Calibration samples
     
-    float dc_offset = 2048.0f;  // Default center value
-    float gain = 1.0f;          // Software gain multiplier
+    int dc_offset = 2048;  // Default center value
+    int gain = 1;          // Software gain multiplier
     bool calibrated = false;
 };
 

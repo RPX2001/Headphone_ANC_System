@@ -18,14 +18,19 @@ void MicInput::calibrate() {
     
     delay(500);  // Wait for environment to settle
     
-    float sum = 0.0f;
-    for (int i = 0; i < CAL_SAMPLES; i++) {
-        int raw = analogRead(MIC_PIN);
-        sum += (float)raw;
-        delayMicroseconds(100);  // Small delay between samples
+    int avg_offset = 0;
+    for (int j=0; j<3; j++) {
+        int sum = 0;
+        for (int i = 0; i < CAL_SAMPLES; i++) {
+            int raw = analogRead(MIC_PIN);
+            Serial.print(raw);
+            Serial.print(" ");
+            sum += raw;
+            delayMicroseconds(100);  // Small delay between samples
+        }
+        avg_offset += int(sum/CAL_SAMPLES);  
     }
-    
-    dc_offset = sum / (float)CAL_SAMPLES;
+    dc_offset = int(avg_offset / 3);
     calibrated = true;
     
     Serial.print("DC offset calibrated: ");

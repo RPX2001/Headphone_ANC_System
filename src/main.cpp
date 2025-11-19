@@ -36,33 +36,33 @@ void setup() {
 
 void loop() {
     // Example 1: Read raw microphone value
-    int raw = mic.readRaw();
+    // int raw = mic.readRaw();
     
-    // Example 2: Read normalized microphone value (-1.0 to +1.0)
-    float normalized = mic.read();
+    // // Example 2: Read normalized microphone value (-1.0 to +1.0)
+    // float normalized = mic.read();
     
-    // Print every 100ms
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 100) {
-        Serial.print("Mic Raw: ");
-        Serial.print(raw);
-        Serial.print(" | Normalized: ");
-        Serial.println(normalized, 3);
-        lastPrint = millis();
-    }
+    // // Print every 100ms
+    // static unsigned long lastPrint = 0;
+    // if (millis() - lastPrint > 100) {
+    //     Serial.print("Mic Raw: ");
+    //     Serial.print(raw);
+    //     Serial.print(" | Normalized: ");
+    //     Serial.println(normalized, 3);
+    //     lastPrint = millis();
+    // }
     
-    // Example 3: Generate and play a simple tone on speaker1
-    // (Uncomment to test speaker output)
-    /*
-    static int16_t sineBuffer[32];
-    static int phase = 0;
-    for (int i = 0; i < 32; i++) {
-        float angle = 2.0 * PI * (phase + i) / 80.0;  // 200Hz at 16kHz
-        sineBuffer[i] = (int16_t)(5000.0 * sin(angle));
-    }
-    speaker1.writeBuffer(sineBuffer, 32);
-    phase = (phase + 32) % 80;
-    */
+    // // Example 3: Generate and play a simple tone on speaker1
+    // // (Uncomment to test speaker output)
+    // /*
+    // static int16_t sineBuffer[32];
+    // static int phase = 0;
+    // for (int i = 0; i < 32; i++) {
+    //     float angle = 2.0 * PI * (phase + i) / 80.0;  // 200Hz at 16kHz
+    //     sineBuffer[i] = (int16_t)(5000.0 * sin(angle));
+    // }
+    // speaker1.writeBuffer(sineBuffer, 32);
+    // phase = (phase + 32) % 80;
+    // */
     
-    delay(10);
+    // delay(10);
 }
