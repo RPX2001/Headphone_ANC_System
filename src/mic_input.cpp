@@ -4,12 +4,12 @@ void MicInput::begin() {
     // Configure ADC resolution
     analogReadResolution(ADC_RESOLUTION);
     
-    // Optional: Set attenuation for better dynamic range
-    // ADC_11db gives full scale voltage of ~3.3V
-    // Uncomment if needed:
+    // MAX4466 outputs 0-3.3V with DC bias at VCC/2 (~1.65V)
+    // Use 11dB attenuation to measure full 0-3.3V range properly
     analogSetPinAttenuation(MIC_PIN, ADC_11db);
     
-    Serial.println("Microphone ADC initialized on GPIO39");
+    Serial.println("Microphone ADC initialized on GPIO34");
+    Serial.println("ADC range: 0-3.3V (11dB attenuation)");
 }
 
 void MicInput::calibrate() {
