@@ -9,12 +9,16 @@ void MicInput::begin() {
     // Uncomment if needed:
     analogSetPinAttenuation(MIC_PIN, ADC_11db);
     
+    #ifdef DEBUG_MIC
     Serial.println("Microphone ADC initialized on GPIO39");
+    #endif
 }
 
 void MicInput::calibrate() {
+    #ifdef DEBUG_MIC
     Serial.println("Calibrating microphone DC offset...");
     Serial.println("Keep microphone in quiet environment.");
+    #endif
     
     delay(500);  // Wait for environment to settle
     
@@ -24,21 +28,29 @@ void MicInput::calibrate() {
         for (int i = 0; i < CAL_SAMPLES; i++) {
             int raw = analogRead(MIC_PIN);
             sum += raw;
+            #ifdef DEBUG_MIC
             Serial.print(raw);
             Serial.print(" ");
+            #endif
             delayMicroseconds(100);  // Small delay between samples
         }
         
         dc_offset = sum / CAL_SAMPLES;
+        #ifdef DEBUG_MIC
         Serial.println(dc_offset);
+        #endif
         avg += dc_offset;
+        #ifdef DEBUG_MIC
         Serial.println(avg);
+        #endif
     }
     dc_offset = avg/3;
     calibrated = true;
     
+    #ifdef DEBUG_MIC
     Serial.print("DC offset calibrated: ");
     Serial.println(dc_offset);
+    #endif
 }
 
 float MicInput::read() {

@@ -67,7 +67,7 @@ void loop() {
     //     float angle = 2.0 * PI * (phase + i) / 80.0;  // 200Hz at 16kHz
     //     sineBuffer[i] = (int16_t)(5000.0 * sin(angle));
     // }
-    // speaker1.writeBuffer(sineBuffer, 32);
+    //  speaker1.writeBuffer(sineBuffer, 32);
     // phase = (phase + 32) % 80;
     // */
     
